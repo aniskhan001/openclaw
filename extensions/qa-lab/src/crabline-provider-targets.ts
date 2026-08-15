@@ -2,22 +2,12 @@ import { createHash } from "node:crypto";
 import type {
   OpenClawCrablineInbound,
   OpenClawCrablineInboundInput,
-  StartedOpenClawCrablineAdapter,
+  StartedOpenClawCrablineCorrelatedAdapter,
 } from "@openclaw/crabline";
 import type { QaBusInboundMessageInput } from "./runtime-api.js";
 
-const TELEGRAM_QA_DRIVER_ID = "100001";
-const TELEGRAM_QA_OBSERVER_ID = "100002";
 const MATRIX_QA_SERVER_NAME = "matrix-qa.test";
 const MATRIX_QA_DRIVER_ID = `@driver:${MATRIX_QA_SERVER_NAME}`;
-
-export function resolveTelegramQaSenderId(senderId: string) {
-  return senderId === "driver"
-    ? TELEGRAM_QA_DRIVER_ID
-    : senderId === "observer"
-      ? TELEGRAM_QA_OBSERVER_ID
-      : senderId;
-}
 
 function resolveMatrixQaSenderId(senderId: string) {
   return senderId === "driver"
@@ -49,31 +39,12 @@ function normalizeExplicitMatrixTarget(target: string) {
   return /^[!@#]/u.test(normalized) && normalized.includes(":") ? normalized : undefined;
 }
 
-function encodeQaThreadComponent(value: string) {
-  return value.replaceAll("%", "%25").replaceAll("/", "%2F");
-}
-
 function resolveMatrixQaTarget(target: string) {
   const explicitTarget = normalizeExplicitMatrixTarget(target);
   if (explicitTarget) {
     return explicitTarget;
   }
   if (target.startsWith("thread:")) {
-    if (target.startsWith("thread:/v1/")) {
-      const rest = target.slice("thread:/v1/".length);
-      const separator = rest.indexOf("/");
-      if (separator > 0) {
-        try {
-          const conversationId = decodeURIComponent(rest.slice(0, separator));
-          const resolvedConversationId =
-            normalizeExplicitMatrixTarget(conversationId) ??
-            resolveMatrixQaConversationId(conversationId);
-          return `thread:/v1/${encodeQaThreadComponent(resolvedConversationId)}${rest.slice(separator)}`;
-        } catch {
-          return target;
-        }
-      }
-    }
     const threadTarget = target.slice("thread:".length);
     const separator = threadTarget.indexOf("/");
     if (separator > 0) {
@@ -104,7 +75,7 @@ function resolveMatrixQaText(text: string, botUserId: string) {
 }
 
 export function createCrablineProviderInboundInput(
-  adapter: StartedOpenClawCrablineAdapter,
+  adapter: StartedOpenClawCrablineCorrelatedAdapter,
   input: QaBusInboundMessageInput,
 ): OpenClawCrablineInboundInput {
   const kind = input.conversation.kind === "direct" ? "direct" : "group";
@@ -119,11 +90,7 @@ export function createCrablineProviderInboundInput(
       kind,
     },
     senderId:
-      adapter.channel === "telegram"
-        ? resolveTelegramQaSenderId(input.senderId)
-        : adapter.channel === "matrix"
-          ? resolveMatrixQaSenderId(input.senderId)
-          : input.senderId,
+      adapter.channel === "matrix" ? resolveMatrixQaSenderId(input.senderId) : input.senderId,
     text:
       adapter.channel === "matrix" && adapter.manifest.provider === "matrix"
         ? resolveMatrixQaText(input.text, adapter.manifest.botUserId)
@@ -132,25 +99,23 @@ export function createCrablineProviderInboundInput(
 }
 
 export function resolveCrablineStateConversation(params: {
-  adapter: StartedOpenClawCrablineAdapter;
+  adapter: StartedOpenClawCrablineCorrelatedAdapter;
   input: QaBusInboundMessageInput;
   providerInbound: OpenClawCrablineInbound;
 }) {
-  return params.adapter.channel === "matrix"
+  return ["mattermost", "matrix", "telegram"].includes(params.adapter.channel)
     ? params.input.conversation
     : params.providerInbound.stateConversation;
 }
 
 export function createCrablineProviderDelivery(
-  adapter: StartedOpenClawCrablineAdapter,
+  adapter: StartedOpenClawCrablineCorrelatedAdapter,
   target: string,
+  threadId?: string,
 ) {
-  const delivery = adapter.createAgentDelivery({
+  const { providerTargetKey, ...delivery } = adapter.createAgentDelivery({
     target: adapter.channel === "matrix" ? resolveMatrixQaTarget(target) : target,
+    threadId,
   });
-  return {
-    delivery,
-    providerTargetKey:
-      adapter.channel === "matrix" ? delivery.to.replace(/^room:/u, "") : delivery.to,
-  };
+  return { delivery, providerTargetKey };
 }

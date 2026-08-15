@@ -1,4 +1,4 @@
-// Qa Lab tests cover Crabline local-provider transport integration behavior.
+// Qa Lab tests cover Crabline channel-driver integration with local provider servers.
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OpenClawCrablineChannelDriverSelection } from "@openclaw/crabline";
@@ -14,10 +14,10 @@ afterEach(() => {
 
 function createSelection(channel: OpenClawCrablineChannelDriverSelection["channel"] = "telegram") {
   return {
-    capabilityMatrixPath: "crabline-fake-provider-capabilities.json",
+    capabilityMatrixPath: "crabline-channel-driver-capabilities.json",
     channel,
     channelDriver: "crabline",
-    smokeArtifactPath: "crabline-fake-provider-smoke.json",
+    providerReadinessArtifactPath: "crabline-provider-readiness.json",
   } as const;
 }
 
@@ -97,7 +97,7 @@ describe("crabline transport", () => {
         expect(delivery.replyTo).toBe(delivery.to);
 
         await expect(
-          fs.access(path.join(outputDir, "crabline-fake-provider-server.json")),
+          fs.access(path.join(outputDir, "crabline-provider-server.json")),
         ).rejects.toMatchObject({ code: "ENOENT" });
         await expect(
           transport.sendInbound({
@@ -129,15 +129,14 @@ describe("crabline transport", () => {
       });
 
       try {
-        expect(transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" })).toMatchObject({
-          channels: {
-            telegram: {
-              allowFrom: ["100001"],
-              groupAllowFrom: ["100001"],
-              groupPolicy: "allowlist",
-            },
-          },
+        const gatewayConfig = transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" });
+        const telegramConfig = gatewayConfig.channels?.telegram;
+        expect(telegramConfig).toMatchObject({
+          allowFrom: [expect.stringMatching(/^[1-9]\d+$/u)],
+          groupAllowFrom: [expect.stringMatching(/^[1-9]\d+$/u)],
+          groupPolicy: "allowlist",
         });
+        const allowedDriverId = Number(telegramConfig?.allowFrom?.[0]);
         await transport.state.addInboundMessage({
           conversation: { id: "qa-routing-ordering", kind: "group" },
           senderId: "observer",
@@ -149,8 +148,7 @@ describe("crabline transport", () => {
           text: "driver",
         });
 
-        const config = transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" });
-        const telegram = config.channels?.telegram as
+        const telegram = gatewayConfig.channels?.telegram as
           | { apiRoot?: string; botToken?: string }
           | undefined;
         const apiRoot = requireString(telegram?.apiRoot, "Telegram API root");
@@ -159,7 +157,9 @@ describe("crabline transport", () => {
         const payload = (await response.json()) as {
           result?: Array<{ message?: { from?: { id?: number }; text?: string } }>;
         };
-        expect(payload.result?.map((update) => update.message?.from?.id)).toEqual([100002, 100001]);
+        const senderIds = payload.result?.map((update) => update.message?.from?.id);
+        expect(senderIds?.[0]).not.toBe(allowedDriverId);
+        expect(senderIds?.[1]).toBe(allowedDriverId);
       } finally {
         await transport.cleanup?.();
       }
@@ -241,6 +241,13 @@ describe("crabline transport", () => {
       });
 
       try {
+        await transport.state.addInboundMessage({
+          conversation: { id: "-1001234567890", kind: "group" },
+          senderId: "100001",
+          text: "Provision forum topic.",
+          threadId: "42",
+        });
+        await transport.state.reset();
         const config = transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" });
         const telegram = config.channels?.telegram as
           | { apiRoot?: string; botToken?: string }
@@ -429,7 +436,9 @@ describe("crabline transport", () => {
         const env = transport.createRuntimeEnvPatch?.() ?? {};
         expect(env).toMatchObject({
           CRABLINE_WHATSAPP_ADMIN_TOKEN: expect.any(String),
-          CRABLINE_WHATSAPP_RECORDER_PATH: expect.stringMatching(/whatsapp-fake-provider\.jsonl$/u),
+          CRABLINE_WHATSAPP_RECORDER_PATH: expect.stringMatching(
+            /whatsapp-provider-server\.jsonl$/u,
+          ),
           CRABLINE_WHATSAPP_SELF_JID: "15550000000@s.whatsapp.net",
           OPENCLAW_WHATSAPP_WEB_SOCKET_URL: expect.stringMatching(
             /^ws:\/\/127\.0\.0\.1:\d+\/ws\/chat\?access_token=/u,
@@ -639,7 +648,7 @@ describe("crabline transport", () => {
     });
   });
 
-  it("normalizes native Mattermost post creation into outbound state", async () => {
+  it("correlates Mattermost's authoritative inbound channel with symbolic QA state", async () => {
     await withTempDir("qa-crabline-transport-", async (outputDir) => {
       const transport = await createQaCrablineTransportAdapter({
         outputDir,
@@ -649,42 +658,57 @@ describe("crabline transport", () => {
 
       try {
         await transport.state.addInboundMessage({
-          conversation: { id: "qa-channel", kind: "group" },
+          conversation: { id: "alice", kind: "direct" },
           senderId: "alice",
           senderName: "Alice",
           text: "Mattermost baseline marker check.",
         });
-        const delivery = transport.buildAgentDelivery({ target: "group:qa-channel" });
         const env = transport.createRuntimeEnvPatch?.() ?? {};
         const mattermostUrl = requireString(env.MATTERMOST_URL, "Mattermost URL");
         const botToken = requireString(env.MATTERMOST_BOT_TOKEN, "Mattermost bot token");
-        const { response, release } = await fetchWithSsrFGuard({
-          url: `${mattermostUrl}/api/v4/posts`,
-          init: {
-            body: JSON.stringify({
-              channel_id: delivery.to.replace(/^channel:/u, ""),
-              message: "assistant via fake mattermost",
-            }),
-            headers: {
-              authorization: `Bearer ${botToken}`,
-              "content-type": "application/json",
+        const mattermostRequest = async <T>(apiPath: string, init?: RequestInit) => {
+          const headers = new Headers(init?.headers);
+          headers.set("authorization", `Bearer ${botToken}`);
+          headers.set("content-type", "application/json");
+          const { response, release } = await fetchWithSsrFGuard({
+            url: `${mattermostUrl}/api/v4${apiPath}`,
+            init: {
+              ...init,
+              headers,
             },
-            method: "POST",
-          },
-          policy: { allowPrivateNetwork: true },
-          auditContext: "qa-lab-crabline-mattermost-transport-test",
+            policy: { allowPrivateNetwork: true },
+            auditContext: "qa-lab-crabline-mattermost-transport-test",
+          });
+          try {
+            expect(response.ok).toBe(true);
+            return (await response.json()) as T;
+          } finally {
+            await release();
+          }
+        };
+        const bot = await mattermostRequest<{ id: string }>("/users/me");
+        const alice = await mattermostRequest<{ id: string }>("/users/username/alice");
+        const directChannel = await mattermostRequest<{ id: string }>("/channels/direct", {
+          body: JSON.stringify([bot.id, alice.id]),
+          method: "POST",
         });
-        await release();
-        expect(response.ok).toBe(true);
+        const outboundPost = await mattermostRequest<{ channel_id: string }>("/posts", {
+          body: JSON.stringify({
+            channel_id: directChannel.id,
+            message: "assistant via fake mattermost",
+          }),
+          method: "POST",
+        });
+        expect(outboundPost.channel_id).toBe(directChannel.id);
 
         await expect(
           transport.waitForOutbound({
-            conversation: { id: "qa-channel", kind: "group" },
+            conversation: { id: "alice", kind: "direct" },
             textIncludes: "assistant via fake mattermost",
             timeoutMs: 1_000,
           }),
         ).resolves.toMatchObject({
-          conversation: { id: "qa-channel", kind: "group" },
+          conversation: { id: "alice", kind: "direct" },
           text: "assistant via fake mattermost",
         });
       } finally {
@@ -750,11 +774,11 @@ describe("crabline transport", () => {
           to: "room:!qa:matrix.test",
         });
         expect(() => transport.buildAgentDelivery({ target: "group:" })).toThrow(
-          "Matrix QA conversation id must be non-empty",
+          "invalid qa-channel group target",
         );
-        expect(() => transport.buildAgentDelivery({ target: "thread:/v1/main/%24event" })).toThrow(
-          "Matrix thread targets require OpenClaw QA thread forwarding",
-        );
+        expect(() =>
+          transport.buildAgentDelivery({ target: "thread:main/$event:matrix.test" }),
+        ).toThrow("Matrix thread targets require OpenClaw QA thread forwarding");
         await expect(
           transport.state.addInboundMessage({
             conversation: { id: "  ", kind: "group" },
@@ -773,7 +797,7 @@ describe("crabline transport", () => {
         ).resolves.toMatchObject({
           conversation: { id: roomId, kind: "group" },
           direction: "inbound",
-          id: expect.stringMatching(/^\$[a-f0-9]{16}:matrix\.test$/u),
+          id: expect.stringMatching(/^\$[A-Za-z0-9_-]{43}$/u),
           senderId: "driver",
           text: "Matrix baseline marker check.",
         });
@@ -922,7 +946,7 @@ describe("crabline transport", () => {
       });
 
       try {
-        const inbound = await transport.state.addInboundMessage({
+        await transport.state.addInboundMessage({
           conversation: {
             id: "telegram-command-room",
             kind: "channel",
@@ -938,11 +962,23 @@ describe("crabline transport", () => {
           | undefined;
         expect(telegram?.apiRoot).toBeTruthy();
         expect(telegram?.botToken).toBeTruthy();
+        const updatesResponse = await fetch(
+          `${telegram?.apiRoot}/bot${telegram?.botToken}/getUpdates`,
+        );
+        const updates = (await updatesResponse.json()) as {
+          result?: Array<{ message?: { chat?: { id?: number } } }>;
+        };
+        const authoritativeChatId = updates.result?.at(-1)?.message?.chat?.id;
+        expect(authoritativeChatId).toEqual(expect.any(Number));
+        const groupDelivery = transport.buildAgentDelivery({
+          target: "channel:telegram-command-room",
+        });
+        expect(groupDelivery.to).toBe(String(authoritativeChatId));
         const { response, release } = await fetchWithSsrFGuard({
           url: `${telegram?.apiRoot}/bot${telegram?.botToken}/sendMessage`,
           init: {
             body: JSON.stringify({
-              chat_id: inbound.conversation.id,
+              chat_id: groupDelivery.to,
               text: "assistant via fake telegram",
             }),
             headers: { "content-type": "application/json" },
